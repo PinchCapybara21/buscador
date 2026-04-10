@@ -1,1 +1,49 @@
+name: Generar y Enviar Informe SECOP – Javeriana
 
+on:
+  # Todos los lunes a las 9am hora Colombia (UTC-5 → 14:00 UTC)
+  # Se corre 1 hora después de actualizar_datos.yml (que corre a las 13:00 UTC)
+  schedule:
+    - cron: '0 14 * * 1'
+  workflow_dispatch:   # permite correr manualmente desde GitHub
+
+permissions:
+  contents: write
+
+jobs:
+  generar-informe:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: |
+          pip install pandas numpy pyarrow matplotlib \
+                      sentence-transformers scikit-learn
+
+      - name: Generar y enviar informe
+        env:
+          EMAIL_SENDER:   ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+          SMTP_HOST:      ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:      ${{ secrets.SMTP_PORT }}
+        run: python scripts/informe_2.py
+
+      # Guarda el PDF generado en el repo como respaldo
+      - name: Guardar PDF como respaldo
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          [ -f data/informe_secop_javeriana.pdf ] && git add data/informe_secop_javeriana.pdf
+          git diff --cached --quiet || git commit -m "Auto: informe SECOP $(date +'%Y-%m-%d')"
+          git push
+        continue-on-error: true
