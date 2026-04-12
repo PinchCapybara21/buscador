@@ -1027,9 +1027,9 @@ with PdfPages(PDF_PATH) as pdf:
 
 print(f"✅ PDF generado: {PDF_PATH}")
 # ── PASO 5: Enviar correo ─────────────────────────────────────────────────────
-EMAIL_SENDER   = os.environ.get("EMAIL_SENDER",   "almacenbiancasilva11@gmail.com")
-EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD", "yylxvoxojnjlvfae")
-EMAIL_TO_RAW   = os.environ.get("EMAIL_TO",       "juansilva11@outlook.com, danimorav05@gmail.com, hannagabrielahidalgorodriguez@gmail.com")
+EMAIL_SENDER   = os.environ.get("EMAIL_SENDER")
+EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
+EMAIL_TO_RAW   = os.environ.get("EMAIL_TO")
 EMAIL_TO       = [e.strip() for e in EMAIL_TO_RAW.split(",") if e.strip()]
 SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT      = int(os.environ.get("SMTP_PORT", 587))
