@@ -1,1 +1,33 @@
+name: Informe SECOP diario
 
+on:
+  schedule:
+    - cron: '0 15 * * *'  # 10 AM Colombia (UTC-5) = 15:00 UTC
+  workflow_dispatch:       # permite correrlo manualmente también
+
+jobs:
+  generar-informe:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          lfs: true          # descarga los embeddings .npy desde LFS
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias
+        run: |
+          pip install pandas numpy matplotlib sentence-transformers scikit-learn geopandas tabulate pyarrow shapely
+
+      - name: Correr informe
+        env:
+          EMAIL_SENDER:   ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+        run: |
+          python scripts/informe_2.py
