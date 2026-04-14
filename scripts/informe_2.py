@@ -1,4 +1,3 @@
-
 import pandas as pd
 import numpy as np
 import geopandas as gpd
@@ -19,13 +18,77 @@ from email import encoders
 import smtplib
 import matplotlib.ticker as mtick
 from matplotlib.lines import Line2D
-
+import requests
+from io import BytesIO
+from PIL import Image as PILImage
+from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 RUTA_GRAFICOS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
 os.makedirs(RUTA_GRAFICOS, exist_ok=True)
-
+DIC_COLORES = {
+    'verde':    ["#009966"],
+    'ro_am_na': ["#FFE9C5", "#F7B261", "#D8841C", "#dd722a", "#C24C31", "#BC3B26"],
+    'az_verd':  ["#CBECEF", "#81D3CD", "#0FB7B3", "#009999"],
+    'ax_viol':  ["#D9D9ED", "#2F399B", "#1A1F63", "#262947"],
+    'ofiscal':  ["#F9F9F9", "#2635bf"],
+    'colors':   ["#262947", "#009999", "#81D3CD", "#dd722a", "#F7B261"]
+}
+ 
+# Color principal de cada fuente  (coherente en TODOS los gráficos)
+COLOR_SECOP1 = "#2F399B"   # azul-violeta  — ax_viol[1]
+COLOR_SECOP2 = "#D8841C"   # naranja medio — ro_am_na[2]
+ 
+# Colores para el donut de tipo de entidad
+COLOR_ORDEN = {
+    'Territorial':          "#2F399B",   # teal  — az_verd[3]
+    'Nacional':             "#262947",   # azul muy oscuro — ax_viol[3]
+    'Corporación Autónoma': "#dd722a",   # naranja cálido  — ro_am_na[3]
+    'No Definido':          "#D9D9ED",   # gris lavanda    — ax_viol[0]
+}
+ 
+# Colores institucionales del PDF
+COLOR_BLUE   = "#2635bf"   # ofiscal[1]
+COLOR_ACCENT = "#D8841C"   # ro_am_na[2]  línea separadora
+ 
+# ============================================================
+# 🔧 CAMBIO 3 — LOGO: descarga única y función auxiliar
+# ============================================================
+ 
+def cargar_logo(ruta: str, max_height_px: int = 60):
+    try:
+        img = PILImage.open(ruta).convert("RGBA")
+        ratio = max_height_px / img.height
+        new_size = (int(img.width * ratio), max_height_px)
+        img = img.resize(new_size, PILImage.LANCZOS)
+        arr = np.array(img)
+        print(f"✅ Logo cargado correctamente desde: {ruta}")  # ← ANTES del return
+        return arr
+    except Exception as e:
+        print(f"⚠️ No se pudo cargar el logo: {e}")
+        return None
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ruta_logo = os.path.join(BASE_DIR, "data", "logo_sapo.png")
+print(f"Buscando logo en: {ruta_logo}")
+print(f"¿Existe el archivo? {os.path.exists(ruta_logo)}")
+LOGO_ARRAY = cargar_logo(ruta_logo)
+print(f"LOGO_ARRAY es None: {LOGO_ARRAY is None}")
+def poner_logo(fig, logo_array=None, x=0.01, y=0.005, zoom=0.3):
+    """Pega el logo en la esquina inferior-izquierda de la figura."""
+    if logo_array is None:
+        logo_array = LOGO_ARRAY  # ← lee la variable global en tiempo de ejecución
+    if logo_array is None:
+        return
+    imagebox = OffsetImage(logo_array, zoom=zoom)
+    ab = AnnotationBbox(
+        imagebox,
+        (x, y),
+        xycoords="figure fraction",
+        frameon=False,
+        box_alignment=(0, 0),
+    )
+    fig.add_artist(ab)
 def guardar_grafico(nombre):
     ruta = os.path.join(RUTA_GRAFICOS, f"{nombre}.png")
-    plt.savefig(ruta, dpi=150, bbox_inches="tight")
+    plt.savefig(ruta, dpi=180, bbox_inches="tight")
     plt.close()
     print(f"✅ Guardado: {ruta}")
 muns = pd.read_parquet("https://raw.githubusercontent.com/PinchCapybara21/api_fiscal/main/muns.parquet")
@@ -57,7 +120,7 @@ COLUMNAS_s1 = [
     ]
 COLUMNAS_s2 = [
     "nit_entidad", "ordenentidad", "entidad",
-    "modalidad_de_contratacion", "fase",'ciudad_de_la_unidad_de', 'departamento_entidad',
+    "modalidad_de_contratacion", 'estado_del_procedimiento','ciudad_de_la_unidad_de', 'departamento_entidad',
     "descripci_n_del_procedimiento", "fecha_de_publicacion_del",
     "precio_base",
     "urlproceso", "score"
@@ -105,20 +168,35 @@ resultados_secop1 = resultados_secop1.rename(columns={
     'departamento_entidad': 'departamento_entidad', #12
     'fuente': 'fuente' #13
     })
+resultados_secop2 = resultados_secop2.rename(columns={
+    'estado_del_procedimiento': 'fase', #1
+})
+
 todo = pd.concat([resultados_secop1, resultados_secop2], ignore_index=True)
-print(todo.to_string(max_colwidth=None, index=False))
-"""
-# =========================================
-# 🧪 PRUEBA
-# =========================================
-consulta = "cundinamarca"
-resultados = buscar_semantico(consulta, top_k=5)
+# print(todo.to_string(max_colwidth=None, index=False))
 
-from tabulate import tabulate
+# ─────────────────────────────────────────────
+# FILTRO: última semana + estado activo por fuente
+# ─────────────────────────────────────────────
+todo["fecha_de_publicacion_del"] = pd.to_datetime(
+    todo["fecha_de_publicacion_del"], errors="coerce"
+)
 
-print(f"\n🔎 Resultados para: {consulta}\n")
-print(tabulate(resultados, headers='keys', tablefmt='pretty', showindex=False))
-"""
+fecha_corte = pd.Timestamp.today() - pd.Timedelta(weeks=3)
+
+mask_fecha = todo["fecha_de_publicacion_del"] >= fecha_corte
+
+mask_estado = (
+    ((todo["fuente"] == "secop I")  & (todo["fase"].str.upper().str.strip() == "CONVOCADO")) |
+    ((todo["fuente"] == "secop II") & (todo["fase"].str.upper().str.strip() == "PUBLICADO"))
+)
+
+todo = todo[mask_fecha & mask_estado].reset_index(drop=True)
+
+print(f"✅ Registros tras filtro: {len(todo)} "
+      f"(SECOP I: {(todo['fuente']=='secop I').sum()} | "
+      f"SECOP II: {(todo['fuente']=='secop II').sum()})")
+
 # KPIs
 todo["precio_base"] = pd.to_numeric(todo["precio_base"], errors="coerce")
 total_contratos    = len(todo)
@@ -135,11 +213,6 @@ part = todo.groupby("fuente").agg(
     pct_valor=lambda x: (x["valor"] / valor_total * 100).round(1)
 )
 
-"""
-# Proveedores únicos — activar cuando tengas la columna
-proveedores_unicos = todo["nombre_proveedor"].nunique()
-"""
-
 print(f"Total contratos    : {total_contratos}")
 print(f"Valor total        : ${valor_total:,.0f}")
 print(f"Valor promedio     : ${valor_promedio:,.0f}")
@@ -155,18 +228,16 @@ def clasificar_orden(valor):
     v = str(valor).strip()
     if v in ["Nacional", "NACIONAL CENTRALIZADO"]:
         return "Nacional"
-    if v in ["TERRITORIAL DEPARTAMENTAL CENTRALIZADO", "TERRITORIAL DEPARTAMENTAL DESCENTRALIZADO"]:
-        return "Territorial Departamental"
-    if v in ["TERRITORIAL DISTRITAL MUNICIPAL NIVEL 2", "TERRITORIAL DISTRITAL MUNICIPAL NIVEL 4",
-             "TERRITORIAL DISTRITAL MUNICIPAL NIVEL 5", "TERRITORIAL DISTRITAL MUNICIPAL NIVEL 6"]:
-        return "Territorial Municipal"
-    if v == "Territorial":
+    if v in ["TERRITORIAL DEPARTAMENTAL CENTRALIZADO", "TERRITORIAL DEPARTAMENTAL DESCENTRALIZADO",
+             "TERRITORIAL DISTRITAL MUNICIPAL NIVEL 2", "TERRITORIAL DISTRITAL MUNICIPAL NIVEL 4",
+             "TERRITORIAL DISTRITAL MUNICIPAL NIVEL 5", "TERRITORIAL DISTRITAL MUNICIPAL NIVEL 6",
+             "Territorial"]:
         return "Territorial"
     if v == "Corporación Autónoma":
         return "Corporación Autónoma"
     return "No Definido"
 
-todo["orden_clasificado"] = todo["ordenentidad"].apply(clasificar_orden)
+todo["orden_clasificado"] = todo["ordenentidad"].fillna("No Definido").apply(clasificar_orden)
 
 orden_contratos = todo.groupby("orden_clasificado").size().reset_index(name="n_contratos")
 orden_valor     = todo.groupby("orden_clasificado")["precio_base"].sum().reset_index(name="valor_total")
@@ -199,22 +270,23 @@ print(todo['modalidad_de_contratacion'].unique())
 def clasificar_modalidad(valor):
     if pd.isna(valor):
         return "No Definido"
-    v = str(valor).upper()
+    v = str(valor).upper().strip()
     if "DIRECTA" in v:
         return "Contratación Directa"
-    if "LICITACi" in v or "LICITACI" in v:
+    elif "LICITACION" in v or "LICITACIÓN" in v: 
         return "Licitación Pública"
-    if "MENOR CUANT" in v:
+    elif "MENOR CUANT" in v or "MINIMA CUANTIA" in v or "MÍNIMA CUANTÍA" in v:
         return "Menor Cuantía"
-    if "CONCURSO" in v:
+    elif "CONCURSO" in v or "MERITOS" in v:
         return "Concurso de Méritos"
-    if "SUBASTA" in v:
+    elif "SUBASTA" in v:
         return "Subasta"
-    if "CONVENIOS" in v or "PARTES" in v:
-        return "Convenios"
-    if "ESPECIAL" in v:
+    elif "CONVENIO" in v or "MAS DE DOS PARTES" in v or "MÁS DE DOS PARTES" in v:
+        return "Convenios" 
+    elif "ESPECIAL" in v or "REGIMEN ESPECIAL" in v or "RÉGIMEN ESPECIAL" in v:
         return "Régimen Especial"
-    return "Otra"
+    else:
+        return "Otra"
 
 todo["modalidad_clasificada"] = todo["modalidad_de_contratacion"].apply(clasificar_modalidad)
 
@@ -292,164 +364,196 @@ print(colombia.columns.tolist())
 print(colombia["NOMBRE_DPT"].unique())
 """
 #EMPEZAMOS CON GRAFICOS
+#tort a 1 -------------------------------------------------------------------------------------------------------
+def grafico_torta_orden(todo, fuente, nombre_archivo):
+    if todo.empty:
+        conteo = pd.Series({"Sin datos": 1})
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.text(0.5, 0.5, "Sin contratos\nen este periodo",
+                ha="center", va="center", fontsize=14, color="#999",
+                transform=ax.transAxes)
+        ax.axis("off")
+        ax.set_title(f"Distribución de contratos por tipo de entidad\n{fuente}",
+                     fontsize=14, weight='semibold')
+        guardar_grafico(nombre_archivo)
+        return
 
-conteo = todo["orden_clasificado"].value_counts()
+    conteo = todo["orden_clasificado"].value_counts().sort_values(ascending=False)
 
-conteo = conteo.sort_values(ascending=False)
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
 
-fig, ax = plt.subplots(figsize=(10, 6))
+    wedges, _ = ax.pie(
+        conteo,
+        startangle=90,
+        wedgeprops=dict(width=0.38),
+        colors=[COLOR_ORDEN.get(cat) for cat in conteo.index]
 
-def formato(pct):
+    )
     total = conteo.sum()
-    val = int(round(pct * total / 100))
-    return f"{pct:.1f}%\n({val})"
-wedges, _ = ax.pie(
-    conteo,
-    startangle=90,
-    wedgeprops=dict(width=0.38),)
-total = conteo.sum()
 
-UMBRAL_PCT = 3.0
+    UMBRAL_PCT = 3.0
 
-for wedge, val in zip(wedges, conteo):
-    ang = (wedge.theta2 + wedge.theta1) / 2
-    ang_rad = ang * (math.pi / 180)
-    cos_a = math.cos(ang_rad)
-    sin_a = math.sin(ang_rad)
+    for wedge, val in zip(wedges, conteo):
+        ang = (wedge.theta2 + wedge.theta1) / 2
+        ang_rad = ang * (math.pi / 180)
+        cos_a = math.cos(ang_rad)
+        sin_a = math.sin(ang_rad)
 
-    pct = val / total * 100
-    label = f"{pct:.1f}%\n({val})"
+        pct = val / total * 100
+        label = f"{pct:.1f}%\n({val})"
 
-    if pct < UMBRAL_PCT:
-        r_inner = 1.05
-        r_text  = 1.22
-        x_line, y_line = r_inner * cos_a, r_inner * sin_a
-        x_text, y_text = r_text  * cos_a, r_text  * sin_a
-        ha = "left" if cos_a >= 0 else "right"
+        if pct < UMBRAL_PCT:
+            r_inner = 1.05
+            r_text  = 1.22
+            x_line, y_line = r_inner * cos_a, r_inner * sin_a
+            x_text, y_text = r_text  * cos_a, r_text  * sin_a
+            ha = "left" if cos_a >= 0 else "right"
 
-        ax.annotate(
-            label,
-            xy=(x_line, y_line),
-            xytext=(x_text, y_text),
-            ha=ha, va="center",
-            fontsize=9, weight="bold", color="#333333",
-            arrowprops=dict(arrowstyle="-", color="#999999", lw=0.8),
-        )
-    else:
-        r_text = 0.78  
-        x_text = r_text * cos_a
-        y_text = r_text * sin_a
+            ax.annotate(
+                label,
+                xy=(x_line, y_line),
+                xytext=(x_text, y_text),
+                ha=ha, va="center",
+                fontsize=9, weight="bold", color="#333333",
+                arrowprops=dict(arrowstyle="-", color="#999999", lw=0.8),
+            )
+        else:
+            r_text = 0.78
+            x_text = r_text * cos_a
+            y_text = r_text * sin_a
 
-        ax.text(
-            x_text, y_text, label,
-            ha="center", va="center",
-            fontsize=10, weight="bold", color="#333333"
-        )
+            ax.text(
+                x_text, y_text, label,
+                ha="center", va="center",
+                fontsize=10, weight="bold", color="#333333"
+            )
 
-centre_circle = plt.Circle((0, 0), 0.58, fc='white')
-fig.gca().add_artist(centre_circle)
+    centre_circle = plt.Circle((0, 0), 0.58, fc='white')
+    fig.gca().add_artist(centre_circle)
 
-ax.text(0, 0, f"{total:,}\nContratos",
-        ha='center', va='center', fontsize=13,
-        weight='semibold', color="#222222")
+    ax.text(0, 0, f"{total:,}\nContratos",
+            ha='center', va='center', fontsize=13,
+            weight='semibold', color="#222222")
 
-ax.legend(
-    wedges, conteo.index,
-    title="Tipo de entidad",
-    loc="center left", bbox_to_anchor=(1, 0.5),
-    frameon=False, fontsize=10, title_fontsize=11
-)
+    ax.legend(
+        wedges, conteo.index,
+        title="Tipo de entidad",
+        loc="center left", bbox_to_anchor=(1, 0.5),
+        frameon=False, fontsize=10, title_fontsize=11
+    )
 
-ax.set_title("Distribución de contratos por tipo de entidad",
-             fontsize=14, weight='semibold', pad=15)
+    ax.set_title(f"Distribución de contratos por tipo de entidad\n{fuente}",
+                 fontsize=14, weight='semibold', pad=15, loc='center')
 
-plt.subplots_adjust(right=0.68)
-guardar_grafico('tora_1')
+    plt.subplots_adjust(right=0.68)
+    guardar_grafico(nombre_archivo)
+
+secop1 = todo[todo["fuente"] == "secop I"]
+secop2 = todo[todo["fuente"] == "secop II"]
+
+grafico_torta_orden(secop1, "SECOP I",  "torta_orden_secop1")
+grafico_torta_orden(secop2, "SECOP II", "torta_orden_secop2", )
 #tora 2 _---------------------------------------------------------------------------------------------------
-orden_valor = todo.groupby("orden_clasificado")["precio_base"].sum().reset_index(name="valor_total")
-orden_valor = orden_valor.sort_values(by="valor_total", ascending=False).reset_index(drop=True)
+#torta 2 -------------------------------------------------------------------------------------------------------
+def grafico_torta_valor(todo, fuente, nombre_archivo, color="#4C72B0"):
+    if todo.empty or todo["precio_base"].sum() == 0:
+        fig, ax = plt.subplots(figsize=(11, 7))
+        ax.text(0.5, 0.5, "Sin valor contratado\nen este periodo",
+                ha="center", va="center", fontsize=14, color="#999",
+                transform=ax.transAxes)
+        ax.axis("off")
+        ax.set_title(f"Distribución de precio base por tipo de entidad\n{fuente}",
+                     fontsize=14, weight='semibold')
+        guardar_grafico(nombre_archivo)
+        return  
+    orden_valor = todo.groupby("orden_clasificado")["precio_base"].sum().reset_index(name="valor_total")
+    orden_valor = orden_valor.sort_values(by="valor_total", ascending=False).reset_index(drop=True)
 
-total_precio = orden_valor["valor_total"].sum()
-UMBRAL_PCT = 3.0
+    total_precio = orden_valor["valor_total"].sum()
+    UMBRAL_PCT = 3.0
+    grandes = orden_valor[orden_valor["valor_total"] / total_precio * 100 >= UMBRAL_PCT].reset_index(drop=True)
+    pequeños = orden_valor[orden_valor["valor_total"] / total_precio * 100 < UMBRAL_PCT].reset_index(drop=True)
 
-grandes = orden_valor[orden_valor["valor_total"] / total_precio * 100 >= UMBRAL_PCT].reset_index(drop=True)
-pequeños = orden_valor[orden_valor["valor_total"] / total_precio * 100 < UMBRAL_PCT].reset_index(drop=True)
+    filas = []
+    pi = 0
+    for i, g in grandes.iterrows():
+        filas.append(g)
+        if pi < len(pequeños):
+            filas.append(pequeños.iloc[pi])
+            pi += 1
 
-filas = []
-pi = 0
-for i, g in grandes.iterrows():
-    filas.append(g)
-    if pi < len(pequeños):
+    while pi < len(pequeños):
         filas.append(pequeños.iloc[pi])
         pi += 1
 
-while pi < len(pequeños):
-    filas.append(pequeños.iloc[pi])
-    pi += 1
+    orden_reorg = pd.DataFrame(filas).reset_index(drop=True)
 
-orden_reorg = pd.DataFrame(filas).reset_index(drop=True)
+    fig, ax = plt.subplots(figsize=(11, 7))
 
-fig, ax = plt.subplots(figsize=(11, 7))
+    wedges, _ = ax.pie(
+        orden_reorg["valor_total"],
+        startangle=90,
+        wedgeprops=dict(width=0.38),
+        colors=[color] * len(orden_reorg)
+    )
 
-wedges, _ = ax.pie(
-    orden_reorg["valor_total"],
-    startangle=90,
-    wedgeprops=dict(width=0.38),
-)
+    def formato_precio(val):
+        val = float(val)
+        if val >= 1_000_000_000_000:
+            return f"${val/1_000_000_000_000:.1f}B"
+        elif val >= 1_000_000_000:
+            return f"${val/1_000_000_000:.1f}MM"
+        elif val >= 1_000_000:
+            return f"${val/1_000_000:.1f}M"
+        else:
+            return f"${val:,.0f}"
 
-def formato_precio(val):
-    val = float(val)
-    if val >= 1_000_000_000_000:
-        return f"${val/1_000_000_000_000:.1f}B"
-    elif val >= 1_000_000_000:
-        return f"${val/1_000_000_000:.1f}MM"
-    elif val >= 1_000_000:
-        return f"${val/1_000_000:.1f}M"
-    else:
-        return f"${val:,.0f}"
+    for wedge, val in zip(wedges, orden_reorg["valor_total"]):
+        pct = float(val) / total_precio * 100
+        ang = (wedge.theta2 + wedge.theta1) / 2
+        ang_rad = ang * math.pi / 180
+        cos_a = math.cos(ang_rad)
+        sin_a = math.sin(ang_rad)
+        label = f"{pct:.1f}%\n{formato_precio(val)}"
 
-for wedge, val in zip(wedges, orden_reorg["valor_total"]):
-    pct = float(val) / total_precio * 100
-    ang = (wedge.theta2 + wedge.theta1) / 2
-    ang_rad = ang * math.pi / 180
-    cos_a = math.cos(ang_rad)
-    sin_a = math.sin(ang_rad)
-    label = f"{pct:.1f}%\n{formato_precio(val)}"
+        if pct < UMBRAL_PCT:
+            r_inner, r_text = 1., 1.1
+            ax.annotate(
+                label,
+                xy=(r_inner * cos_a, r_inner * sin_a),
+                xytext=(r_text * cos_a, r_text * sin_a),
+                ha="left" if cos_a >= 0 else "right",
+                va="center", fontsize=8, weight="bold", color="#333333",
+                arrowprops=dict(arrowstyle="-", color="#999999", lw=0.8),
+            )
+        else:
+            r_text = 0.78
+            ax.text(
+                r_text * cos_a, r_text * sin_a, label,
+                ha="center", va="center",
+                fontsize=10, weight="bold", color="#333333"
+            )
 
-    if pct < UMBRAL_PCT:
-        r_inner, r_text = 1., 1.1
-        ax.annotate(
-            label,
-            xy=(r_inner * cos_a, r_inner * sin_a),
-            xytext=(r_text * cos_a, r_text * sin_a),
-            ha="left" if cos_a >= 0 else "right",
-            va="center", fontsize=8, weight="bold", color="#333333",
-            arrowprops=dict(arrowstyle="-", color="#999999", lw=0.8),
-        )
-    else:
-        r_text = 0.78
-        ax.text(
-            r_text * cos_a, r_text * sin_a, label,
-            ha="center", va="center",
-            fontsize=10, weight="bold", color="#333333"
-        )
-
-centre_circle = plt.Circle((0, 0), 0.58, fc="white")
-fig.gca().add_artist(centre_circle)
-ax.text(0, 0, f"{formato_precio(total_precio)}\nTotal",
-        ha="center", va="center", fontsize=13, weight="semibold", color="#222222")
-ax.legend(
-    wedges, orden_reorg["orden_clasificado"],
-    title="Tipo de entidad",
-    loc="center left", bbox_to_anchor=(1, 0.5),
-    frameon=False, fontsize=10, title_fontsize=11
-)
-ax.set_title("Distribución de precio base por tipo de entidad",
+    centre_circle = plt.Circle((0, 0), 0.58, fc="white")
+    fig.gca().add_artist(centre_circle)
+    ax.text(0, 0, f"{formato_precio(total_precio)}\nTotal",
+            ha="center", va="center", fontsize=13, weight="semibold", color="#222222")
+    ax.legend(
+        wedges, orden_reorg["orden_clasificado"],
+        title="Tipo de entidad",
+        loc="center left", bbox_to_anchor=(1, 0.5),
+        frameon=False, fontsize=10, title_fontsize=11
+    )
+    ax.set_title(f"Distribución de precio base por tipo de entidad\n{fuente}",
              fontsize=14, weight="semibold", pad=15)
 
-plt.subplots_adjust(right=0.65)
-plt.tight_layout()
-guardar_grafico('torta_2')
+    plt.subplots_adjust(right=0.65)
+    plt.tight_layout()
+    guardar_grafico(nombre_archivo)
+
+grafico_torta_valor(secop1, "SECOP I",  "torta_valor_secop1", COLOR_SECOP1)
+grafico_torta_valor(secop2, "SECOP II", "torta_valor_secop2", "#D8841C")
 #GRAFICO SERIE DE TIEMPO CONTRATO POR QUINCENA  -------------------------------------------------------------------------
 def quincena(fecha):
     if pd.isna(fecha):
@@ -469,51 +573,6 @@ contratos_quincena["quincena_str"] = (
     np.where(contratos_quincena["quincena"].dt.day == 1, " Q1", " Q2")
 )
 
-pivot = contratos_quincena.pivot(
-    index="quincena_str",
-    columns="fuente",
-    values="n_contratos"
-).fillna(0)
-
-pivot = pivot.sort_index()
-
-# =========================================
-# 🎨 GRÁFICO
-# =========================================
-plt.figure(figsize=(13,6))
-
-line1, = plt.plot(pivot.index, pivot["secop I"], marker='o', linewidth=2)
-line2, = plt.plot(pivot.index, pivot["secop II"], marker='s', linewidth=2, linestyle='--')
-
-# =========================================
-# ✨ ESTÉTICA
-# =========================================
-plt.title("Evolución quincenal de contratos", fontsize=16, fontweight='bold')
-plt.xlabel("Periodo (Quincena)")
-plt.ylabel("Número de contratos")
-
-plt.xticks(rotation=45)
-plt.grid(alpha=0.3)
-
-# Quitar bordes feos
-for spine in ["top", "right"]:
-    plt.gca().spines[spine].set_visible(False)
-
-# =========================================
-# 📌 LEYENDA AL LADO (CLAVE)
-# =========================================
-plt.legend(
-    [line1, line2],
-    ["SECOP I", "SECOP II"],
-    title="Fuente",
-    loc="center left",
-    bbox_to_anchor=(1, 0.5),
-    frameon=False
-)
-
-plt.tight_layout()
-guardar_grafico('serie_tiempo')
-
 # TOP 5 Y 10 -------------------------------------------------------------------------------------------------------
 top5_entidades  = valor_por_entidad.head(5)["entidad"]
 top10_entidades = valor_por_entidad.head(10)["entidad"]
@@ -525,33 +584,57 @@ def secop_concentracion(entidades):
 
 top5_secop_pct  = (secop_concentracion(top5_entidades)  / valor_total * 100).round(1)
 top10_secop_pct = (secop_concentracion(top10_entidades) / valor_total * 100).round(1)
-
+s1_vacio = todo[todo["fuente"] == "secop I"].empty
+s2_vacio = todo[todo["fuente"] == "secop II"].empty
 # Grafico
 labels    = ["Top 5", "Top 10"]
-secop_i   = [top5_secop_pct.get("secop I", 0),  top10_secop_pct.get("secop I", 0)]
-secop_ii  = [top5_secop_pct.get("secop II", 0), top10_secop_pct.get("secop II", 0)]
-
-plt.figure(figsize=(7, 5))
-plt.bar(labels, secop_i,  label="SECOP I")
-plt.bar(labels, secop_ii, bottom=secop_i, label="SECOP II")
-
-plt.title("Concentración del valor contratado por SECOP", fontsize=14, fontweight="bold")
-plt.ylabel("% del valor total")
-plt.ylim(0, 100)
-
-for spine in ["top", "right"]:
-    plt.gca().spines[spine].set_visible(False)
-
-plt.grid(axis="y", alpha=0.3)
-plt.legend()
-
-totales = [a + b for a, b in zip(secop_i, secop_ii)]
-for i, total in enumerate(totales):
-    plt.text(i, total + 1, f"{total:.1f}%", ha="center", fontweight="bold")
-
+plt.figure(figsize=(8, 6))
+if s1_vacio or valor_total == 0:
+    plt.text(0.5, 0.5, "Sin datos\nen este periodo", ha="center", va="center",
+             fontsize=14, color="#999", transform=plt.gca().transAxes)
+    plt.axis("off")
+else:
+    bars1 = plt.bar(labels, 
+                [top5_secop_pct.get("secop I", 0), top10_secop_pct.get("secop I", 0)],
+                color=COLOR_SECOP1, alpha=0.9) 
+    plt.ylabel("% del valor total contratado")
+    plt.ylim(0, 100)
+    for bar in bars1:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2, height + 1.5,
+                 f"{height:.1f}%", ha='center', fontsize=11, fontweight='bold')
+    plt.grid(axis="y", alpha=0.3, linestyle='--')
+    for spine in ["top", "right"]:
+        plt.gca().spines[spine].set_visible(False)
+plt.title("Concentración del valor contratado - SECOP I", fontsize=14, fontweight="bold", pad=20)
 plt.tight_layout()
-guardar_grafico('top_5_10')
+guardar_grafico('top_5_10_secop_I')
 
+
+# BARRAS SECOP II
+plt.figure(figsize=(8, 6))
+if s2_vacio or valor_total == 0:
+    plt.text(0.5, 0.5, "Sin datos\nen este periodo", ha="center", va="center",
+             fontsize=14, color="#999", transform=plt.gca().transAxes)
+    plt.axis("off")
+else:
+    bars2 = plt.bar(labels,
+                    [top5_secop_pct.get("secop II", 0), top10_secop_pct.get("secop II", 0)],
+                    color=COLOR_SECOP2, alpha=0.9)
+    plt.ylabel("% del valor total contratado")
+    plt.ylim(0, 100)
+    for bar in bars2:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2, height + 1.5,
+                 f"{height:.1f}%", ha='center', fontsize=11, fontweight='bold')
+    plt.grid(axis="y", alpha=0.3, linestyle='--')
+    for spine in ["top", "right"]:
+        plt.gca().spines[spine].set_visible(False)
+
+plt.title("Concentración del valor contratado - SECOP II", fontsize=14, fontweight="bold", pad=20)
+plt.tight_layout()
+guardar_grafico('top_5_10_secop_II')
+#GRAFICO DE BARRAS HORIZONTALES DESCOMPOSICION POR ENTIDAD TOP 10 -------------------------------------------------------------------------------------------------------
 top_n = 10
 
 valor_por_entidad = (
@@ -560,165 +643,154 @@ valor_por_entidad = (
     .sort_values(ascending=False)
     .reset_index()
 )
+# =============================================
+# GRÁFICO 1: TOP 10 ENTIDADES - SOLO SECOP I
+# =============================================
 
-top_entidades = valor_por_entidad.head(top_n).copy()
-
-top_entidades["pct_valor"] = (
-    top_entidades["precio_base"] / todo["precio_base"].sum() * 100
-)
-
-
-df_top = todo[todo["entidad"].isin(top_entidades["entidad"])]
-
-
-tabla = (
-    df_top.groupby(["entidad", "fuente"])["precio_base"]
+# Filtrar solo SECOP I y tomar top 10
+top10_secop1 = (
+    todo[todo["fuente"] == "secop I"]
+    .groupby("entidad")["precio_base"]
     .sum()
-    .unstack()
-    .fillna(0)
+    .sort_values(ascending=False)
+    .head(top_n)
+    .reset_index()
 )
 
-tabla = tabla.reindex(top_entidades["entidad"])
+top10_secop1["pct"] = top10_secop1["precio_base"] / todo["precio_base"].sum() * 100
 
-
-total_general = todo["precio_base"].sum()
-tabla_pct = tabla / total_general * 100
-
-fig, ax = plt.subplots(figsize=(12,7))
-
-ax.barh(
-    top_entidades["entidad"],
-    tabla_pct["secop I"],
-    label="SECOP I"
-)
-
-ax.barh(
-    top_entidades["entidad"],
-    tabla_pct["secop II"],
-    left=tabla_pct["secop I"],
-    label="SECOP II"
-)
-
-ax.invert_yaxis()
-
-ax.set_title("Descomposición del peso de cada entidad por SECOP", fontsize=14)
-ax.set_xlabel("% del total del sistema")
-
-totales_entidad = top_entidades["pct_valor"]
-
-for i, total in enumerate(totales_entidad):
-    ax.text(
-        total + 0.3,
-        i,
-        f"{total:.1f}%",
-        va="center",
-        fontweight="bold"
-    )
-
-ax.grid(axis="x", alpha=0.3)
-
-for spine in ["top", "right"]:
-    ax.spines[spine].set_visible(False)
-
-ax.legend()
-
+fig, ax = plt.subplots(figsize=(12, 8))
+if s1_vacio or top10_secop1.empty:
+    ax.text(0.5, 0.5, "Sin datos\nen este periodo", ha="center", va="center",
+            fontsize=14, color="#999", transform=ax.transAxes)
+    ax.axis("off")
+else:
+    ax.barh(top10_secop1["entidad"], top10_secop1["pct"], color="#2F399B", alpha=0.9)
+    ax.invert_yaxis()
+    ax.set_xlabel("% del valor total del sistema")
+    for i, pct in enumerate(top10_secop1["pct"]):
+        ax.text(pct + 0.2, i, f"{pct:.1f}%", va='center', fontweight='bold', fontsize=11)
+    ax.grid(axis="x", alpha=0.3)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+ax.set_title("Top 10 Entidades por Valor Contratado - SECOP I", fontsize=15, fontweight="bold", pad=20)
 plt.tight_layout()
-guardar_grafico('top_valor')
-#MODALIDAD DE CONTRATACION--------------------------------------------------------------------------------------------------------
-total = modalidad_contratos["n_contratos"].sum()
-modalidad_contratos["pct"] = (modalidad_contratos["n_contratos"] / total * 100).round(1)
+guardar_grafico('top10_secop_I')
+# =============================================
+# GRÁFICO 2: TOP 10 ENTIDADES - SOLO SECOP II
+# =============================================
 
-tabla_secop = (
-    todo.groupby(["modalidad_clasificada", "fuente"])
-    .size()
-    .unstack()
-    .fillna(0)
-)
-
-# asegurar columnas
-for col in ["secop I", "secop II"]:
-    if col not in tabla_secop.columns:
-        tabla_secop[col] = 0
-
-tabla_secop = tabla_secop[["secop I", "secop II"]]
-
-# ordenar igual que el gráfico principal
-tabla_secop = tabla_secop.loc[tabla_secop.sum(axis=1).sort_values().index]
-
-# ================================
-# 5. GRÁFICO
-fig, ax = plt.subplots(figsize=(10,6))
-
-ax.barh(tabla_secop.index, tabla_secop["secop I"], label="SECOP I")
-ax.barh(tabla_secop.index, tabla_secop["secop II"], left=tabla_secop["secop I"], label="SECOP II")
-
-ax.set_title("Modalidades más utilizadas y su distribución SECOP I vs II", fontsize=14, fontweight="bold")
-ax.set_xlabel("Número de contratos")
-
-# ================================
-# 6. ETIQUETAS (% de uso de modalidad)
-# ================================
-for i, (v, p) in enumerate(zip(modalidad_contratos["n_contratos"], modalidad_contratos["pct"])):
-    ax.text(v + 1, i, f"{p}%", va="center")
-
-ax.grid(axis="x", linestyle="--", alpha=0.4)
-
-for spine in ["top", "right"]:
-    ax.spines[spine].set_visible(False)
-
-ax.legend()
-
-plt.tight_layout()
-guardar_grafico('modalidada')
-# MODALIDAD VALOOORRR
-modalidad_valor = (
-    todo.groupby(["modalidad_clasificada", "fuente"])["precio_base"]
+top10_secop2 = (
+    todo[todo["fuente"] == "secop II"]
+    .groupby("entidad")["precio_base"]
     .sum()
-    .unstack()
-    .fillna(0)
+    .sort_values(ascending=False)
+    .head(top_n)
+    .reset_index()
 )
-for col in ["secop I", "secop II"]:
-    if col not in modalidad_valor.columns:
-        modalidad_valor[col] = 0
 
-modalidad_valor = modalidad_valor[["secop I", "secop II"]]
+top10_secop2["pct"] = top10_secop2["precio_base"] / todo["precio_base"].sum() * 100
 
-modalidad_valor = modalidad_valor.loc[modalidad_valor.sum(axis=1).sort_values().index]
-
-fig, ax = plt.subplots(figsize=(10,6))
-
-ax.barh(modalidad_valor.index, modalidad_valor["secop I"], label="SECOP I")
-ax.barh(modalidad_valor.index, modalidad_valor["secop II"], left=modalidad_valor["secop I"], label="SECOP II")
-
-ax.set_title("Modalidades de contratación por valor (SECOP I vs II)", fontsize=14, fontweight="bold")
-ax.set_xlabel("Valor contratado")
-
-totales = modalidad_valor["secop I"] + modalidad_valor["secop II"]
-
-for i, total in enumerate(totales):
-    ax.text(total, i, f"{total:,.0f}", va="center", fontweight="bold")
-
-ax.grid(axis="x", alpha=0.3)
-
-for spine in ["top", "right"]:
-    ax.spines[spine].set_visible(False)
-
-ax.legend()
-
+fig, ax = plt.subplots(figsize=(12, 8))
+if s2_vacio or top10_secop2.empty:
+    ax.text(0.5, 0.5, "Sin datos\nen este periodo", ha="center", va="center",
+            fontsize=14, color="#999", transform=ax.transAxes)
+    ax.axis("off")
+else:
+    ax.barh(top10_secop2["entidad"], top10_secop2["pct"], color=COLOR_SECOP2, alpha=0.9)
+    ax.invert_yaxis()
+    ax.set_xlabel("% del valor total del sistema")
+    for i, pct in enumerate(top10_secop2["pct"]):
+        ax.text(pct + 0.2, i, f"{pct:.1f}%", va='center', fontweight='bold', fontsize=11)
+    ax.grid(axis="x", alpha=0.3)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+ax.set_title("Top 10 Entidades por Valor Contratado - SECOP II", fontsize=15, fontweight="bold", pad=20)
 plt.tight_layout()
-guardar_grafico('modalidad_valor')
+guardar_grafico('top10_secop_II')
+# ============================================================
+# MODALIDAD POR % — separado por fuente (2 subplots)
+# ============================================================
+
+modalidad_contratos["pct"] = (modalidad_contratos["n_contratos"] / modalidad_contratos["n_contratos"].sum() * 100).round(1)
+fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+
+# Define un color por fuente
+colores_fuente_modalidad = {
+    "secop I": "#2F399B",   # azul actual
+    "secop II": COLOR_SECOP2  # naranja
+}
+
+for ax, fuente in zip(axes, ["secop I", "secop II"]):
+    df_f = todo[todo["fuente"] == fuente]
+    if df_f.empty:
+        ax.text(0.5, 0.5, "Sin datos\nen este periodo", ha="center", va="center",
+                fontsize=14, color="#999", transform=ax.transAxes)
+        ax.axis("off")
+        ax.set_title(f"Modalidades más utilizadas\n{fuente.upper()}", fontsize=13, fontweight="bold")
+        continue 
+    conteos = df_f.groupby("modalidad_clasificada").size().sort_values()
+    total_f = conteos.sum()
+    pcts = (conteos / total_f * 100).round(1)
+    
+    color = colores_fuente_modalidad[fuente]  # ← color según la fuente
+    bars = ax.barh(conteos.index, pcts, color=color, height=0.4, alpha=0.9)
+    
+    for i, (v, p) in enumerate(zip(conteos, pcts)):
+        ax.text(p + 0.3, i, f"{p}%", va="center", fontsize=9)
+    
+    ax.set_title(f"Modalidades más utilizadas\n{fuente.upper()}", fontsize=13, fontweight="bold")
+    ax.set_xlabel("% de contratos")
+    ax.grid(axis="x", linestyle="--", alpha=0.4)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+plt.suptitle("Distribución de modalidades de contratación por fuente", fontsize=15, fontweight="bold", y=1.02)
+plt.tight_layout()
+guardar_grafico('modalidad_pct_por_fuente')
+
+
+# ============================================================
+# MODALIDAD POR VALOR — separado por fuente (2 subplots)
+# ============================================================
+
+# fig, axes = plt.subplots(1, 2, figsize=(18, 6))
+
+# for ax, fuente in zip(axes, ["secop I", "secop II"]):
+#     df_f = todo[todo["fuente"] == fuente]
+#     if df_f.empty:
+#         ax.text(0.5, 0.5, "Sin datos\nen este periodo", ha="center", va="center",
+#                 fontsize=14, color="#999", transform=ax.transAxes)
+#         ax.axis("off")
+#         ax.set_title(f"Valor contratado por modalidad\n{fuente.upper()}", fontsize=13, fontweight="bold")
+#         continue
+#     valores = df_f.groupby("modalidad_clasificada")["precio_base"].sum().sort_values()
+    
+#     ax.barh(valores.index, valores.values, color="#DD8452", height=0.4)
+    
+#     for i, v in enumerate(valores):
+#         ax.text(v, i, f" ${v/1e9:.1f}B", va="center", fontsize=9)
+    
+#     ax.set_title(f"Valor contratado por modalidad\n{fuente.upper()}", fontsize=13, fontweight="bold")
+#     ax.set_xlabel("Valor contratado (pesos)")
+#     ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x/1e9:.0f}B"))
+#     ax.grid(axis="x", linestyle="--", alpha=0.4)
+#     for spine in ["top", "right"]:
+#         ax.spines[spine].set_visible(False)
+
+# plt.suptitle("Valor de modalidades de contratación por fuente", fontsize=15, fontweight="bold", y=1.02)
+# plt.tight_layout()
+# guardar_grafico('modalidad_valor_por_fuente')
 #INTENTO GEO
-todo["ciudad_de_la_unidad_de"] = todo["ciudad_de_la_unidad_de"].astype(str).str.strip().str.upper()
-
-geo_contratos = todo.groupby("ciudad_de_la_unidad_de").size().reset_index(name="n_contratos")
-
-geo_secop = todo.groupby(["ciudad_de_la_unidad_de", "fuente"])["precio_base"].sum().unstack().fillna(0)
-
-geo = geo_contratos.merge(geo_secop, on="ciudad_de_la_unidad_de")
-
-geo["valor_total"] = geo.get("secop I", 0) + geo.get("secop II", 0)
-
-top_geo = geo.sort_values("valor_total", ascending=False).head(10)
+# ─────────────────────────────────────────────
+# PREPARACIÓN
+# ─────────────────────────────────────────────
+todo["ciudad_de_la_unidad_de"] = (
+    todo["ciudad_de_la_unidad_de"]
+    .astype(str)
+    .str.strip()
+    .str.upper()
+)
 
 def formato_millones(x, pos):
     if x >= 1e12:
@@ -730,62 +802,100 @@ def formato_millones(x, pos):
     else:
         return f"{x:,.0f}"
 
-fig, ax1 = plt.subplots(figsize=(13,6))
 
-ax1.barh(
-    top_geo["ciudad_de_la_unidad_de"],
-    top_geo.get("secop I", 0),
-    color="#4C78A8",
-    label="SECOP I"
-)
+# ─────────────────────────────────────────────
+# FUNCIÓN PARA HACER EL GRÁFICO POR FUENTE
+# ─────────────────────────────────────────────
+def grafico_geo_por_fuente(df, fuente, nombre_archivo, color_barra):
+    
+    df_f = df[df["fuente"] == fuente]
+     # ── GUARDIA ──
+    if df_f.empty:
+        fig, ax = plt.subplots(figsize=(13, 6))
+        ax.text(0.5, 0.5, "Sin datos\nen este periodo", ha="center", va="center",
+                fontsize=14, color="#999", transform=ax.transAxes)
+        ax.axis("off")
+        ax.set_title(f"Top 10 ciudades - {fuente}", fontsize=14, fontweight="bold")
+        guardar_grafico(nombre_archivo)
+        return
 
-ax1.barh(
-    top_geo["ciudad_de_la_unidad_de"],
-    top_geo.get("secop II", 0),
-    left=top_geo.get("secop I", 0),
-    color="#F58518",
-    label="SECOP II"
-)
+    # contratos
+    geo_contratos = (
+        df_f.groupby("ciudad_de_la_unidad_de")
+        .size()
+        .reset_index(name="n_contratos")
+    )
 
-ax1.set_xlabel("Valor total contratado")
-ax1.xaxis.set_major_formatter(mtick.FuncFormatter(formato_millones))
-ax1.invert_yaxis()
+    # valor
+    geo_valor = (
+        df_f.groupby("ciudad_de_la_unidad_de")["precio_base"]
+        .sum()
+        .reset_index(name="valor_total")
+    )
 
-ax2 = ax1.twiny()
+    # merge
+    geo = geo_contratos.merge(geo_valor, on="ciudad_de_la_unidad_de")
 
-ax2.plot(
-    top_geo["n_contratos"],
-    top_geo["ciudad_de_la_unidad_de"],
-    color="darkred",
-    marker="o",
-    linewidth=2,
-    label="Contratos"
-)
+    # top 10
+    top_geo = geo.sort_values("valor_total", ascending=False).head(10)
 
-ax2.set_xlabel("Número de contratos")
+    # ── GRÁFICO ──
+    fig, ax1 = plt.subplots(figsize=(13,6))
 
-legend_elements = [
-    Line2D([0], [0], color="#4C78A8", lw=6, label="SECOP I"),
-    Line2D([0], [0], color="#F58518", lw=6, label="SECOP II"),
-    Line2D([0], [0], color="darkred", marker="o", lw=2, label="Número de contratos")
-]
+    # barras valor
+    ax1.barh(
+        top_geo["ciudad_de_la_unidad_de"],
+        top_geo["valor_total"],
+        color=color_barra,
+        alpha=0.9
+    )
 
-ax1.legend(handles=legend_elements, loc="lower right", frameon=False)
+    ax1.set_xlabel("Valor total contratado")
+    ax1.xaxis.set_major_formatter(mtick.FuncFormatter(formato_millones))
+    ax1.invert_yaxis()
 
-plt.title("Top 10 ciudades: SECOP I vs II + contratos", fontsize=14, fontweight="bold")
+    # línea contratos
+    ax2 = ax1.twiny()
 
-ax1.grid(axis="x", alpha=0.3)
+    ax2.plot(
+        top_geo["n_contratos"],
+        top_geo["ciudad_de_la_unidad_de"],
+        color="darkred",
+        marker="o",
+        linewidth=2
+    )
 
-for spine in ["top", "right"]:
-    ax1.spines[spine].set_visible(False)
+    ax2.set_xlabel("Número de contratos")
 
-plt.tight_layout()
-guardar_grafico('geo_top')
+    # leyenda
+    legend_elements = [
+        Line2D([0], [0], color=color_barra, lw=6, label="Valor contratado"),
+        Line2D([0], [0], color="darkred", marker="o", lw=2, label="Número de contratos")
+    ]
+
+    ax1.legend(handles=legend_elements, loc="lower right", frameon=False)
+
+    plt.title(f"Top 10 ciudades - {fuente}", fontsize=14, fontweight="bold")
+
+    ax1.grid(axis="x", alpha=0.3)
+
+    for spine in ["top", "right"]:
+        ax1.spines[spine].set_visible(False)
+
+    plt.tight_layout()
+    guardar_grafico(nombre_archivo)
+
+
+# ─────────────────────────────────────────────
+# GENERAR LOS 2 GRÁFICOS
+# ─────────────────────────────────────────────
+grafico_geo_por_fuente(todo, "secop I",  "geo_top_secop_I",  COLOR_SECOP1)
+grafico_geo_por_fuente(todo, "secop II", "geo_top_secop_II", COLOR_SECOP2)
 #---------------------------------------------------------------------------------------
 #ULTIMA TABLA
 #---------------------------------------------------------------------------------------
-cols_tabla = ["nit_entidad", "entidad", "descripci_n_del_procedimiento",
-              "modalidad_de_contratacion", "fase", "precio_base", "fuente", "urlproceso"]
+cols_tabla = ["entidad", "descripci_n_del_procedimiento",
+               "precio_base"]
 
 tabla_top14 = (todo[cols_tabla]
                .assign(score=todo["score"])
@@ -795,302 +905,343 @@ tabla_top14 = (todo[cols_tabla]
 
 #PDF ---------------------------------------------
 hoy_str = date.today().strftime("%d/%m/%Y")
-# ── GENERACIÓN DE PDF ────────────────────────────────────────────────────────
-# Pega este bloque al final de tu script principal.
-# Usa ÚNICAMENTE variables ya definidas: todo, valor_total, total_contratos,
-# valor_promedio, valor_mediana, entidades_unicas, top5, top10,
-# orden_contratos, orden_valor, contratos_quincena, modalidad_contratos,
-# modalidad_valor, valor_por_entidad, hoy_str, RUTA_GRAFICOS
+# ============================================================
+# PDF DASHBOARD - reemplaza todo el bloque de generación PDF
+# ============================================================
+from matplotlib.gridspec import GridSpec
+from matplotlib.image import imread
+import matplotlib.patches as mpatches
 
-COLOR_BLUE = "#003087"
-PDF_PATH   = os.path.join(RUTA_GRAFICOS, "informe_secop.pdf")
+COLOR_BLUE   = "#003087"
+COLOR_ACCENT = "#FFE9C5"
+PDF_PATH     = os.path.join(RUTA_GRAFICOS, "informe_secop.pdf")
 
 def fmt_peso(v):
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return "N/D"
-    if v >= 1e12:  return f"${v/1e12:.1f}B"
-    if v >= 1e9:   return f"${v/1e9:.1f}MM"
-    if v >= 1e6:   return f"${v/1e6:.1f}M"
+    if v >= 1e12: return f"${v/1e12:.1f}B"
+    if v >= 1e9:  return f"${v/1e9:.1f}MM"
+    if v >= 1e6:  return f"${v/1e6:.1f}M"
     return f"${v:,.0f}"
 
-def texto_wrap(ax, texto, y=0.5, fontsize=10):
-    ax.text(0.5, y, texto, ha="center", va="center", fontsize=fontsize,
+def load_img(nombre):
+    """Carga imagen desde RUTA_GRAFICOS, devuelve array o None."""
+    path = os.path.join(RUTA_GRAFICOS, f"{nombre}.png")
+    return imread(path) if os.path.exists(path) else None
+
+def put_img(ax, nombre, title=None):
+    """Pone imagen en un ax, sin ejes."""
+    ax.axis("off")
+    img = load_img(nombre)
+    if img is not None:
+        ax.imshow(img, aspect="auto", interpolation="lanczos")
+        ax.set_aspect("equal")
+    else:
+        ax.text(0.5, 0.5, f"[{nombre}]", ha="center", va="center",
+                color="gray", transform=ax.transAxes, fontsize=8)
+    if title:
+        ax.set_title(title, fontsize=8, color=COLOR_BLUE, fontweight="bold", pad=3)
+
+def kpi_box(ax, label, value, color=COLOR_BLUE, fontsize_val=13):
+    """Dibuja una tarjeta KPI en un ax."""
+    ax.axis("off")
+    ax.set_facecolor("#f0f4ff")
+    rect = mpatches.FancyBboxPatch((0.05, 0.08), 0.90, 0.84,
+        boxstyle="round,pad=0.02", linewidth=1.2,
+        edgecolor=color, facecolor="#f0f4ff",
+        transform=ax.transAxes, zorder=1)
+    ax.add_patch(rect)
+    ax.text(0.5, 0.62, value, ha="center", va="center", fontsize=fontsize_val,
+            fontweight="bold", color=color, transform=ax.transAxes, zorder=2)
+    ax.text(0.5, 0.22, label, ha="center", va="center", fontsize=7.5,
+            color="#555", transform=ax.transAxes, zorder=2, multialignment="center")
+
+def analysis_box(ax, texto):
+    """Caja de texto interpretativo al pie."""
+    ax.axis("off")
+    ax.text(0.5, 0.5, texto, ha="center", va="center", fontsize=8.5,
             color="#333", transform=ax.transAxes, wrap=True,
             multialignment="center",
-            bbox=dict(boxstyle="round,pad=0.4", fc="#f5f7ff", ec="#c8d0e8", lw=1))
+            bbox=dict(boxstyle="round,pad=0.5", fc="#f5f7ff", ec="#c8d0e8", lw=1))
 
-def agregar_pagina_grafico(pdf, img_path, titulo, texto):
-    fig, axes = plt.subplots(2, 1, figsize=(11, 8.5),
-                              gridspec_kw={"height_ratios": [4, 1]})
-    # Gráfico
-    ax_img = axes[0]
-    ax_img.axis("off")
-    if os.path.exists(img_path):
-        from matplotlib.image import imread
-        img = imread(img_path)
-        ax_img.imshow(img, aspect="auto")
-    else:
-        ax_img.text(0.5, 0.5, "Imagen no encontrada", ha="center", va="center",
-                    transform=ax_img.transAxes, color="red")
-    ax_img.set_title(titulo, fontsize=14, fontweight="bold", color=COLOR_BLUE, pad=8)
+def section_header(fig, y, texto, color=COLOR_BLUE):
+    """Línea de sección sobre la figura."""
+    fig.text(0.5, y, texto, ha="center", fontsize=13, fontweight="bold",
+             color=color)
+    fig.add_artist(plt.Line2D([0.05, 0.95], [y-0.012, y-0.012],
+                               color=COLOR_ACCENT, linewidth=1.5,
+                               transform=fig.transFigure))
 
-    # Texto interpretativo
-    ax_txt = axes[1]
-    ax_txt.axis("off")
-    texto_wrap(ax_txt, texto, y=0.5, fontsize=9.5)
-
-    fig.tight_layout(pad=1.5)
-    pdf.savefig(fig)
-    plt.close(fig)
-
-# ── Textos automáticos ───────────────────────────────────────────────────────
+# ── Variables de análisis ─────────────────────────────────────────────────────
 orden_top     = orden_contratos.sort_values("n_contratos", ascending=False).iloc[0]
 orden_top_val = orden_valor.sort_values("valor_total", ascending=False).iloc[0]
 modal_top_c   = modalidad_contratos.sort_values("n_contratos", ascending=False).iloc[0]
-modal_top_v_nombre = modalidad_valor.sum(axis=1).idxmax()
-modal_top_v_valor  = modalidad_valor.sum(axis=1).max()
-top1_entidad  = valor_por_entidad.iloc[0]
+idx           = modalidad_valor["valor_total"].idxmax()
+modal_top_v_nombre = modalidad_valor.loc[idx, "modalidad_clasificada"]
+modal_top_v_valor  = modalidad_valor.loc[idx, "valor_total"]
+
 if "pct_valor" not in valor_por_entidad.columns:
-    valor_por_entidad["pct_valor"] = (valor_por_entidad["precio_base"] / valor_total * 100).round(1)
-    top1_entidad = valor_por_entidad.iloc[0]
+    valor_por_entidad["pct_valor"] = (
+        valor_por_entidad["precio_base"] / valor_total * 100).round(1)
+top1_entidad = valor_por_entidad.iloc[0]
 
 quincena_pico_s1 = (contratos_quincena[contratos_quincena["fuente"] == "secop I"]
                     .sort_values("n_contratos", ascending=False).iloc[0])
 quincena_pico_s2 = (contratos_quincena[contratos_quincena["fuente"] == "secop II"]
                     .sort_values("n_contratos", ascending=False).iloc[0])
 
-textos = {
-    "tora_1": (
-        f"De los {total_contratos:,} contratos identificados, la categoría con mayor participación "
-        f"es '{orden_top['orden_clasificado']}' con {orden_top['n_contratos']:,} contratos "
-        f"({orden_top['n_contratos']/total_contratos*100:.1f}%). La distribución refleja el nivel de "
-        f"gobierno que más ha contratado en los temas buscados."
-    ),
-    "torta_2": (
-        f"En términos de valor, '{orden_top_val['orden_clasificado']}' concentra la mayor proporción "
-        f"del presupuesto con {fmt_peso(orden_top_val['valor_total'])} sobre un total de "
-        f"{fmt_peso(valor_total)}. Esto puede diferir del conteo de contratos, lo que indica "
-        f"presencia de contratos de alto valor en ciertos niveles de gobierno."
-    ),
-    "serie_tiempo": (
-        f"La evolución quincenal muestra que SECOP I alcanzó su pico en la quincena "
-        f"'{quincena_pico_s1['quincena_str']}' con {int(quincena_pico_s1['n_contratos'])} contratos, "
-        f"mientras SECOP II tuvo su mayor actividad en '{quincena_pico_s2['quincena_str']}' "
-        f"con {int(quincena_pico_s2['n_contratos'])} contratos. La tendencia al final del periodo "
-        f"puede reflejar datos aún incompletos por publicación reciente."
-    ),
-    "top_5_10": (
-        f"Las 5 entidades con mayor gasto concentran el {top5}% del valor total contratado, "
-        f"y las 10 primeras acumulan el {top10}%. Este nivel de concentración sugiere que un "
-        f"grupo reducido de entidades domina la contratación en los temas analizados."
-    ),
-    "top_valor": (
-        f"La entidad con mayor peso es '{top1_entidad['entidad']}' con el "
-        f"{top1_entidad['pct_valor']:.1f}% del valor total ({fmt_peso(top1_entidad['precio_base'])}). "
-        f"El color indica si el contrato proviene de SECOP I o II, permitiendo identificar "
-        f"qué plataforma usa cada entidad."
-    ),
-    "modalidad_valor": (
-        f"La modalidad '{modal_top_v_nombre}' es la de mayor valor contratado "
-        f"({fmt_peso(modal_top_v_valor)}), mientras '{modal_top_c['modalidad_clasificada']}' "
-        f"es la más frecuente en número de contratos ({modal_top_c['n_contratos']:,}). "
-        f"Una brecha grande entre ambos rankings puede indicar contratos atípicamente grandes."
-    ),
-    "modalidada": (
-    f"En número de contratos, '{modal_top_c['modalidad_clasificada']}' es la modalidad más usada "
-    f"({modal_top_c['n_contratos']:,} contratos, {modal_top_c['pct']:.1f}%), seguida de Contratación Directa. "
-    f"SECOP I predomina en Régimen Especial y Contratación Directa, mientras SECOP II concentra "
-    f"los contratos de Menor Cuantía, lo que refleja los procesos que cada plataforma gestiona por defecto."
-    ),
-    "geo_top": (
-    f"Las 10 ciudades con mayor valor contratado están encabezadas por "
-    f"'{top_geo.iloc[0]['ciudad_de_la_unidad_de']}' con {fmt_peso(top_geo.iloc[0]['valor_total'])}, "
-    f"seguida de '{top_geo.iloc[1]['ciudad_de_la_unidad_de']}' con {fmt_peso(top_geo.iloc[1]['valor_total'])}. "
-    f"La línea roja muestra que la ciudad con más contratos es "
-    f"'{top_geo.sort_values('n_contratos', ascending=False).iloc[0]['ciudad_de_la_unidad_de']}' "
-    f"({int(top_geo['n_contratos'].max())} contratos), lo que indica que alto valor y alta frecuencia "
-    f"no siempre coinciden en la misma ciudad."
+# KPIs por fuente
+def kpis_fuente(fuente):
+    df = todo[todo["fuente"] == fuente]
+    return {
+        "n":      len(df),
+        "valor":  df["precio_base"].sum(),
+        "prom":   df["precio_base"].mean(),
+        "ents":   df["entidad"].nunique(),
+    }
+k1 = kpis_fuente("secop I")
+k2 = kpis_fuente("secop II")
+MAX_CHARS_ENTIDAD = 45
+top1_nombre_corto = (
+    str(top1_entidad['entidad'])[:MAX_CHARS_ENTIDAD] + "…"
+    if len(str(top1_entidad['entidad'])) > MAX_CHARS_ENTIDAD
+    else str(top1_entidad['entidad'])
 )
-}
-
-# ── Generar PDF ───────────────────────────────────────────────────────────────
-graficos = [
-    ("tora_1",        "Distribución de contratos por tipo de entidad"),
-    ("torta_2",       "Distribución de precio base por tipo de entidad"),
-    ("serie_tiempo",  "Evolución quincenal de contratos"),
-    ("top_5_10",      "Concentración del valor contratado — Top 5 y Top 10"),
-    ("top_valor",     "Descomposición del valor por entidad"),
-    ("modalidad_valor","Modalidades de contratación por valor"),
-    ("modalidada", "Modalidades más utilizadas y su distribución SECOP I vs II"),
-    ("geo_top",       "Top 10 ciudades por valor contratado y número de contratos")
-]
-
+# ── GENERACIÓN PDF ────────────────────────────────────────────────────────────
 with PdfPages(PDF_PATH) as pdf:
 
+    # ══════════════════════════════════════════════════════
+    # PÁGINA 1 — KPIs GLOBALES
+    # ══════════════════════════════════════════════════════
+    # fig = plt.figure(figsize=(11, 8.5), facecolor="white")
+    # fig.text(0.5, 0.93, "Informe de Contratación Pública — SECOP I & II",
+    #          ha="center", fontsize=17, fontweight="bold", color=COLOR_BLUE)
+    # fig.text(0.5, 0.89, f"Generado el {hoy_str}  ·  datos.gov.co",
+    #          ha="center", fontsize=9, color="#888")
+    # fig.add_artist(plt.Line2D([0.05,0.95],[0.875,0.875],
+    #                            color=COLOR_ACCENT, lw=2,
+    #                            transform=fig.transFigure))
 
-    # ── PORTADA ───────────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(8.5, 11))
-    fig.patch.set_facecolor(COLOR_BLUE)
-    ax = fig.add_axes([0, 0, 1, 1]); ax.axis("off"); ax.set_facecolor(COLOR_BLUE)
+    # kpis_globales = [
+    #     ("Contratos\ntotales",    f"{total_contratos:,}"),
+    #     ("Valor total",           fmt_peso(valor_total)),
+    #     ("Valor promedio",        fmt_peso(valor_promedio)),
+    #     ("Mediana",               fmt_peso(valor_mediana)),
+    #     ("Entidades\núnicas",     f"{entidades_unicas:,}"),
+    #     ("SECOP I\ncontratos",    f"{k1['n']:,}"),
+    #     ("SECOP II\ncontratos",   f"{k2['n']:,}"),
+    #     ("SECOP I\nvalor",        fmt_peso(k1['valor'])),
+    #     ("SECOP II\nvalor",       fmt_peso(k2['valor'])),
+    # ]
 
-    # Franja lateral derecha con íconos (simulada con rectángulos de colores)
-    colores_franja = ["#e8501a", "#f4a020", "#2a9d8f", "#264653", "#e76f51", "#2a9d8f", "#e8501a", "#f4a020", "#2a9d8f"]
-    for i, c in enumerate(colores_franja):
-        rect = plt.Rectangle((0.88, 1 - (i+1)*0.111), 0.12, 0.105,
-                              transform=ax.transAxes, color=c, zorder=2)
-        ax.add_patch(rect)
+    # gs = GridSpec(3, 3, figure=fig,
+    #               left=0.06, right=0.94, top=0.84, bottom=0.08,
+    #               hspace=0.45, wspace=0.35)
+    # for i, (lbl, val) in enumerate(kpis_globales):
+    #     ax = fig.add_subplot(gs[i//3, i%3])
+    #     color = COLOR_BLUE if i < 5 else (COLOR_ACCENT if "I\n" in lbl else "#2a9d8f")
+    #     kpi_box(ax, lbl, val, color=color)
 
-    # Franja naranja superior
-    rect_top = plt.Rectangle((0, 0.88), 0.87, 0.12,
-                              transform=ax.transAxes, color="#e8501a", zorder=2)
-    ax.add_patch(rect_top)
+    # pdf.savefig(fig, dpi=180); plt.close(fig)
 
-    # Número de informe
-    ax.text(0.04, 0.935, f"INFORME SECOP · {hoy_str}", color="white",
-            fontsize=9, transform=ax.transAxes, zorder=3)
+    # ══════════════════════════════════════════════════════
+    # PÁGINA 2 — DASHBOARD SECOP I
+    # ══════════════════════════════════════════════════════
+    fig = plt.figure(figsize=(11, 8.5), facecolor="white")
+    section_header(fig, 0.955, "SECOP I — Dashboard. Ultimas 3 semanas", color=COLOR_BLUE)
+    poner_logo(fig)
+    # Layout: col 0-1 = gráficos, col 2 = KPIs verticales
+    gs = GridSpec(3, 3, figure=fig,
+                  left=0.03, right=0.97, top=0.91, bottom=0.04,
+                  hspace=0.38, wspace=0.25,
+                  width_ratios=[4, 4, 1])
 
-    # Título principal
-    ax.text(0.06, 0.72, "INFORME SOBRE\nCONTRATACIÓN\nPÚBLICA EN\nMEDIOS Y\nMARKETING",
-            color="white", fontsize=28, fontweight="bold",
-            transform=ax.transAxes, va="top", linespacing=1.3, zorder=3)
+    # fila 0: torta contratos | torta valor | KPIs
+    ax00 = fig.add_subplot(gs[0, 0]); put_img(ax00, "torta_orden_secop1", "Contratos por tipo entidad")
+    ax01 = fig.add_subplot(gs[0, 1]); put_img(ax01, "torta_valor_secop1", "Valor por tipo entidad")
+    ax02 = fig.add_subplot(gs[0, 2]); kpi_box(ax02, "Contratos\nSECOP I", f"{k1['n']:,}", COLOR_BLUE)
 
-    # Subtítulo
-    ax.text(0.06, 0.40,
-            f"Informe semántico de contratos en SECOP I y II\n"
-            f"relacionados con publicidad, marketing y medios de comunicación.",
-            color="#dddddd", fontsize=10, transform=ax.transAxes,
-            va="top", linespacing=1.5, zorder=3)
+    # fila 1: top10 | geo | más KPIs
+    ax10 = fig.add_subplot(gs[1, 0]); put_img(ax10, "top10_secop_I", "Top 10 entidades")
+    ax11 = fig.add_subplot(gs[1, 1]); put_img(ax11, "geo_top_secop_I", "Top ciudades")
+    ax12 = fig.add_subplot(gs[1, 2]); kpi_box(ax12, "Valor total\nSECOP I", fmt_peso(k1['valor']), COLOR_BLUE)
 
-    # Línea separadora
-    ax.axhline(y=0.22, xmin=0.06, xmax=0.86, color="#e8501a", linewidth=1.5)
+    # fila 2: top 5/10 | análisis | KPI
+    ax20 = fig.add_subplot(gs[2, 0]); put_img(ax20, "top_5_10_secop_I", "Concentración valor")
+    ax21 = fig.add_subplot(gs[2, 1])
+    analysis_box(ax21,
+        f"SECOP I registra {k1['n']:,} contratos por {fmt_peso(k1['valor'])}.\n"
+        f"El tipo de entidad dominante es '{orden_top['orden_clasificado']}' "
+        f"({orden_top['n_contratos']/total_contratos*100:.1f}% del total).\n"
+        f"Las 5 principales entidades concentran el {top5}% del valor.\n"
+        f"Pico de actividad: quincena '{quincena_pico_s1['quincena_str']}' "
+        f"con {int(quincena_pico_s1['n_contratos'])} contratos."
+    )
+    ax22 = fig.add_subplot(gs[2, 2]); kpi_box(ax22, "Entidades\núnicas I", f"{k1['ents']:,}", COLOR_BLUE)
 
-    # Autores
-    ax.text(0.06, 0.20, "Juan Pablo Perilla Silva\nLiceth Daniela Mora Vanegas",
-            color="white", fontsize=10, transform=ax.transAxes, va="top",
-            linespacing=1.6, zorder=3)
+    pdf.savefig(fig, dpi=180); plt.close(fig)
 
-    # Supervisión
-    ax.text(0.06, 0.11, "Supervisado por: Carlos J. Ortiz Bonilla",
-            color="#aac8ff", fontsize=9, transform=ax.transAxes, zorder=3)
+    # ══════════════════════════════════════════════════════
+    # PÁGINA 3 — DASHBOARD SECOP II
+    # ══════════════════════════════════════════════════════
+    fig = plt.figure(figsize=(11, 8.5), facecolor="white")
+    section_header(fig, 0.955, "SECOP II — Dashboard", color='#D8841C')
+    poner_logo(fig)
+    gs = GridSpec(3, 3, figure=fig,
+                  left=0.03, right=0.97, top=0.91, bottom=0.04,
+                  hspace=0.38, wspace=0.25,
+                  width_ratios=[4, 4, 1])
 
-    # Logo texto inferior
-    ax.text(0.06, 0.04, "Observatorio Fiscal · Pontificia Universidad Javeriana",
-            color="#aac8ff", fontsize=8, transform=ax.transAxes, zorder=3)
+    ax00 = fig.add_subplot(gs[0, 0]); put_img(ax00, "torta_orden_secop2", "Contratos por tipo entidad")
+    ax01 = fig.add_subplot(gs[0, 1]); put_img(ax01, "torta_valor_secop2", "Valor por tipo entidad")
+    ax02 = fig.add_subplot(gs[0, 2]); kpi_box(ax02, "Contratos\nSECOP II", f"{k2['n']:,}", "#2a9d8f")
 
-    pdf.savefig(fig, facecolor=fig.get_facecolor()); plt.close(fig)
+    ax10 = fig.add_subplot(gs[1, 0]); put_img(ax10, "top10_secop_II", "Top 10 entidades")
+    ax11 = fig.add_subplot(gs[1, 1]); put_img(ax11, "geo_top_secop_II", "Top ciudades")
+    ax12 = fig.add_subplot(gs[1, 2]); kpi_box(ax12, "Valor total\nSECOP II", fmt_peso(k2['valor']), "#2a9d8f")
 
-    # ── KPIs ──────────────────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(8.5, 11))
-    ax.set_facecolor("white"); ax.axis("off")
-    fig.patch.set_facecolor("white")
+    ax20 = fig.add_subplot(gs[2, 0]); put_img(ax20, "top_5_10_secop_II", "Concentración valor")
+    ax21 = fig.add_subplot(gs[2, 1])
+    analysis_box(ax21,
+        f"SECOP II registra {k2['n']:,} contratos por {fmt_peso(k2['valor'])}.\n"
+        f"La entidad con mayor peso es '{top1_nombre_corto}' "
+        f"con {top1_entidad['pct_valor']:.1f}% del valor total.\n"
+        f"Las 10 principales entidades concentran el {top10}% del valor.\n"
+        f"Pico de actividad: quincena '{quincena_pico_s2['quincena_str']}' "
+        f"con {int(quincena_pico_s2['n_contratos'])} contratos."
+    )
+    ax22 = fig.add_subplot(gs[2, 2]); kpi_box(ax22, "Entidades\núnicas II", f"{k2['ents']:,}", "#2a9d8f")
 
-    ax.text(0.5, 0.95, "Indicadores clave", ha="center", fontsize=18,
-            fontweight="bold", color=COLOR_BLUE, transform=ax.transAxes)
-    ax.plot([0.05, 0.95], [0.925, 0.925], color="#e8501a", linewidth=2,
-            transform=ax.transAxes, zorder=3)
+    pdf.savefig(fig, dpi=180); plt.close(fig)
 
-    kpis = [
-        ("Contratos\nencontrados",  f"{total_contratos:,}"),
-        ("Valor total",             fmt_peso(valor_total)),
-        ("Valor promedio",          fmt_peso(valor_promedio)),
-        ("Mediana",                 fmt_peso(valor_mediana)),
-        ("Entidades únicas",        f"{entidades_unicas:,}"),
-        ("SECOP I\n(contratos)",    f"{part.loc['secop I','n_contratos']:,}"
-                                    f"\n{part.loc['secop I','pct_contratos']}%"),
-        ("SECOP II\n(contratos)",   f"{part.loc['secop II','n_contratos']:,}"
-                                    f"\n{part.loc['secop II','pct_contratos']}%"),
-        ("SECOP I\n(valor)",        f"{fmt_peso(part.loc['secop I','valor'])}"
-                                    f"\n{part.loc['secop I','pct_valor']}%"),
-        ("SECOP II\n(valor)",       f"{fmt_peso(part.loc['secop II','valor'])}"
-                                    f"\n{part.loc['secop II','pct_valor']}%"),
-    ]
+    # ══════════════════════════════════════════════════════
+    # PÁGINA 4 — MODALIDADES
+    # ══════════════════════════════════════════════════════
+    fig = plt.figure(figsize=(11, 8.5), facecolor="white")
+    section_header(fig, 0.955, "Modalidades de Contratación — Tabla busqueda semanticaa")
+    poner_logo(fig)
+    gs = GridSpec(3, 1, figure=fig,
+              left=0.03, right=0.97, top=0.91, bottom=0.03,
+              hspace=0.3,
+              height_ratios=[3, 2.5, 0.6])
+    ax0 = fig.add_subplot(gs[0])
+    put_img(ax0, "modalidad_pct_por_fuente", "% de contratos por modalidad")
 
-    cols, rows = 3, 3
-    card_w, card_h = 0.27, 0.20
-    x_starts = [0.05, 0.37, 0.69]
-    y_starts  = [0.68, 0.42, 0.16]
+    ax1 = fig.add_subplot(gs[1])
+    ax1.axis("off")
+    ax1.set_title("Top contratos por relevancia semántica", fontsize=10, fontweight="bold", color=COLOR_BLUE)
 
-    for idx, (lbl, val) in enumerate(kpis):
-        col = idx % cols
-        row = idx // cols
-        x, y = x_starts[col], y_starts[row]
-
-        rect = plt.Rectangle((x, y), card_w, card_h,
-                              transform=ax.transAxes,
-                              facecolor="#f0f4ff", edgecolor=COLOR_BLUE,
-                              linewidth=1.5, zorder=2)
-        ax.add_patch(rect)
-
-        ax.text(x + card_w/2, y + card_h*0.63, val,
-                ha="center", va="center", fontsize=15, fontweight="bold",
-                color=COLOR_BLUE, transform=ax.transAxes, zorder=3)
-        ax.text(x + card_w/2, y + card_h*0.22, lbl,
-                ha="center", va="center", fontsize=8.5, color="#555",
-                transform=ax.transAxes, zorder=3)
-
-    ax.text(0.5, 0.06,
-            f"Fuente: SECOP I (Convocado) + SECOP II (Publicado) · datos.gov.co · {hoy_str}",
-            ha="center", fontsize=8, color="#999", transform=ax.transAxes)
-
-    pdf.savefig(fig); plt.close(fig)
-    # Páginas de gráficos
-    for nombre, titulo in graficos:
-        img_path = os.path.join(RUTA_GRAFICOS, f"{nombre}.png")
-        agregar_pagina_grafico(pdf, img_path, titulo, textos[nombre])
-    def agregar_tabla(pdf, todo):
-        fig, ax = plt.subplots(figsize=(17, 8))
-        fig.patch.set_facecolor("white")
-        ax.axis("off")
-        ax.set_title("Top 14 contratos por relevancia semántica",
-                 fontsize=14, fontweight="bold", color=COLOR_BLUE, pad=12)
-        def wrap_url(url, ancho=80):
-            url = str(url)
-            return "\n".join([url[i:i+ancho] for i in range(0, len(url), ancho)])
-        def get_url(val):                                    # ← aquí
-            if pd.isna(val) if not isinstance(val, dict) else False:
-                return "N/D"
-            if isinstance(val, dict):
-                return str(list(val.values())[0])
-            return str(val)
-
-        cols_show = ["entidad", "descripci_n_del_procedimiento",
-                 "modalidad_de_contratacion", "fase", "precio_base", "fuente"]
-
-        data = []
-        for _, row in todo.iterrows():
-            data.append([
-                str(row["entidad"])[:30],
-                str(row["descripci_n_del_procedimiento"])[:60],
-                str(row["modalidad_de_contratacion"])[:21],
-                str(row["fase"])[:12],
-                fmt_peso(row["precio_base"]),
-                str(row["fuente"]),
-                get_url(row["urlproceso"])
+    data = []
+    for _, row in tabla_top14.iterrows():
+        data.append([
+            str(row["entidad"])[:30],
+            str(row["descripci_n_del_procedimiento"])[:60],
+            fmt_peso(row["precio_base"]),
         ])
 
-        tbl = ax.table(
+    tbl = ax1.table(          # ← ax1, no ax
         cellText=data,
-        colLabels=["Entidad", "Descripción", "Modalidad", "Fase", "Valor", "Fuente", "URL"],
+        colLabels=["Entidad", "Descripción", "Valor"],   # ← 3 columnas
         cellLoc="left", loc="center",
-        colWidths=[0.20, 0.38, 0.15, 0.10, 0.1, 0.08, 0.38],
-        )
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(7.5)
-        tbl.scale(1, 1.6)
+        colWidths=[0.30, 0.50, 0.20],                    # ← 3 anchos
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(7.5)
+    tbl.scale(1, 1.6)
 
-        for (r, c), cell in tbl.get_celld().items():
-            if r == 0:
-                cell.set_facecolor(COLOR_BLUE)
-                cell.set_text_props(color="white", fontweight="bold")
-            elif r % 2 == 0:
-                cell.set_facecolor("#f0f4ff")
-            cell.set_edgecolor("#dde")
+    for (r, c), cell in tbl.get_celld().items():
+        if r == 0:
+            cell.set_facecolor(COLOR_BLUE)
+            cell.set_text_props(color="white", fontweight="bold")
+        elif r % 2 == 0:
+            cell.set_facecolor("#f0f4ff")
+        cell.set_edgecolor("#dde")
 
-        ax.text(0.5, 0.02, "Ordenado por similitud semántica con las palabras clave de búsqueda.",
-            ha="center", fontsize=8, color="#999", transform=ax.transAxes)
+    ax1.text(0.5, 0.02, "Ordenado por similitud semántica con las palabras clave de búsqueda.",
+            ha="center", fontsize=8, color="#999", transform=ax1.transAxes)  # ← ax1
+    # ax1 = fig.add_subplot(gs[1]); put_img(ax1, "modalidad_valor_por_fuente", "Valor contratado por modalidad") aca puedo poner la tabla
+    ax2 = fig.add_subplot(gs[2])
+    analysis_box(ax2,
+        f"En SECOP I, '{modal_top_c['modalidad_clasificada']}' lidera en frecuencia "
+        f"({modal_top_c['n_contratos']:,} contratos, {modal_top_c['pct']:.1f}%). "
+        f"En valor, '{modal_top_v_nombre}' acumula {fmt_peso(modal_top_v_valor)}. "
+        f"SECOP II concentra sus contratos en Menor Cuantía (100% de sus registros)."
+    )
 
-        pdf.savefig(fig, bbox_inches="tight"); plt.close(fig)
-    agregar_tabla(pdf, tabla_top14)
+
+    pdf.savefig(fig, dpi=180); plt.close(fig)
+
+    # ══════════════════════════════════════════════════════
+    # PÁGINA 5 — SERIE DE TIEMPO
+    # ══════════════════════════════════════════════════════
+    # fig = plt.figure(figsize=(11, 8.5), facecolor="white")
+    # section_header(fig, 0.955, "Evolución Quincenal de Contratos")
+
+    # gs = GridSpec(2, 1, figure=fig,
+    #               left=0.05, right=0.95, top=0.91, bottom=0.10,
+    #               height_ratios=[5, 1], hspace=0.2)
+
+    # ax0 = fig.add_subplot(gs[0]); put_img(ax0, "serie_tiempo")
+    # ax1 = fig.add_subplot(gs[1])
+    # analysis_box(ax1,
+    #     f"SECOP I alcanzó su pico en '{quincena_pico_s1['quincena_str']}' "
+    #     f"con {int(quincena_pico_s1['n_contratos'])} contratos. "
+    #     f"SECOP II tuvo su mayor actividad en '{quincena_pico_s2['quincena_str']}' "
+    #     f"con {int(quincena_pico_s2['n_contratos'])} contratos. "
+    #     f"La caída al final del periodo puede reflejar datos aún incompletos por publicación reciente."
+    # )
+
+    # pdf.savefig(fig, dpi=180); plt.close(fig)
+
+    # # ══════════════════════════════════════════════════════
+    # # PÁGINA 6 — TABLA TOP 14
+    # # ══════════════════════════════════════════════════════
+    # fig, ax = plt.subplots(figsize=(17, 8))
+    # fig.patch.set_facecolor("white")
+    # poner_logo(fig)
+    # ax.axis("off")
+    # ax.set_title("Top 14 contratos por relevancia semántica",
+    #              fontsize=14, fontweight="bold", color=COLOR_BLUE, pad=12)
+
+    # def get_url(val):
+    #     if pd.isna(val) if not isinstance(val, dict) else False: return "N/D"
+    #     if isinstance(val, dict): return str(list(val.values())[0])
+    #     return str(val)
+
+    # data = []
+    # for _, row in tabla_top14.iterrows():
+    #     data.append([
+    #         str(row["entidad"])[:30],
+    #         str(row["descripci_n_del_procedimiento"])[:60],
+    #         # str(row["modalidad_clasificada"])[:21],
+    #         # str(row["fase"])[:12],
+    #         fmt_peso(row["precio_base"]),
+    #         # str(row["fuente"]),
+    #         # get_url(row["urlproceso"])
+    #     ])
+
+    # tbl = ax.table(
+    #     cellText=data,
+    #     colLabels=["Entidad","Descripción","Valor","Fuente","URL"],
+    #     cellLoc="left", loc="center",
+    #     colWidths=[0.20, 0.38, 0.15, 0.10, 0.10, 0.08, 0.38],
+    # )
+    # tbl.auto_set_font_size(False)
+    # tbl.set_fontsize(7.5)
+    # tbl.scale(1, 1.6)
+
+    # for (r, c), cell in tbl.get_celld().items():
+    #     if r == 0:
+    #         cell.set_facecolor(COLOR_BLUE)
+    #         cell.set_text_props(color="white", fontweight="bold")
+    #     elif r % 2 == 0:
+    #         cell.set_facecolor("#f0f4ff")
+    #     cell.set_edgecolor("#dde")
+
+    # ax.text(0.5, 0.02, "Ordenado por similitud semántica con las palabras clave de búsqueda.",
+    #         ha="center", fontsize=8, color="#999", transform=ax.transAxes)
+
+    # pdf.savefig(fig, bbox_inches="tight", dpi=180); plt.close(fig)
 
 print(f"✅ PDF generado: {PDF_PATH}")
 # ── PASO 5: Enviar correo ─────────────────────────────────────────────────────
@@ -1100,7 +1251,6 @@ EMAIL_TO_RAW   = os.environ.get("EMAIL_TO")
 EMAIL_TO       = [e.strip() for e in EMAIL_TO_RAW.split(",") if e.strip()]
 SMTP_HOST      = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT      = int(os.environ.get("SMTP_PORT", 587))
-
 hoy_legible    = date.today().strftime("%d de %B de %Y")
 fuentes_resumen = "  |  ".join([
     f"{f}: {n:,}" for f, n in todo["fuente"].value_counts().items()
