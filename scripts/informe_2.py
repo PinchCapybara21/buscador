@@ -15,8 +15,6 @@ from email import encoders
 import smtplib
 import matplotlib.ticker as mtick
 from matplotlib.lines import Line2D
-import requests
-from io import BytesIO
 from PIL import Image as PILImage
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 RUTA_GRAFICOS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
