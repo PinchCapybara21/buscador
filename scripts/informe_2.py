@@ -123,8 +123,9 @@ COLUMNAS_s2 = [
     "modalidad_de_contratacion", 'estado_del_procedimiento','ciudad_de_la_unidad_de', 'departamento_entidad',
     "descripci_n_del_procedimiento", "fecha_de_publicacion_del",
     "precio_base",
-    "urlproceso", "score"
-]
+    "urlproceso", "score"]
+#aca es con proceso de contratacion, puede que se cambie a CONTRATOS ELECTRONICOS, si es asi, toca cambar el nombre de las columnas a las nuevas y volver a cambairlas a las que
+#tenia en el codigo para que siga sirviendo todo el codigo
 def buscar_secop2 (query: str, top_k: int = 15) -> pd.DataFrame:
     query_limpio = query.lower().strip() 
     query_emb    = model.encode([query_limpio])
